@@ -1,0 +1,4 @@
+/bin/
+*.duckdb
+*.duckdb.wal
+coverage.out

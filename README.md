@@ -1,8 +1,10 @@
 # GoTel
 
-GoTel is a local OpenTelemetry collector and debugging server written in Go. It accepts OTLP/HTTP traces and logs, stores them in embedded DuckDB, and exposes JSON HTTP, CLI, and MCP interfaces for developers and coding agents.
+Let your clanker see.
 
-GoTel has no TUI or browser UI and requires no external database server.
+GoTel is a local OpenTelemetry collector and debugging server written in Go. It accepts OTLP/HTTP traces and logs, stores them in embedded DuckDB, and exposes JSON HTTP, CLI, and MCP interfaces for coding agents.
+
+GoTel has no TUI or browser UI, ask you coding agent to use GoTel instead.
 
 ## Install
 

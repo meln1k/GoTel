@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+SECONDS=0
+
+echo 'Checking system dependencies for Go and DuckDB (CGO)'
+missing_packages=()
+for package in build-essential ca-certificates curl jq; do
+  if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != 'install ok installed' ]]; then
+    missing_packages+=("$package")
+  fi
+done
+if ((${#missing_packages[@]})); then
+  sudo apt-get update
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing_packages[@]}"
+fi
+echo "System dependencies ready (${SECONDS}s elapsed)"
+
+go_version="$(awk '$1 == "go" { print $2; exit }' go.mod)"
+case "$(uname -m)" in
+  x86_64) go_arch=amd64 ;;
+  aarch64) go_arch=arm64 ;;
+  *) echo 'Unsupported orb architecture' >&2; exit 1 ;;
+esac
+go_root="/usr/local/lib/go${go_version}"
+if [[ ! -x "$go_root/bin/go" ]] || [[ "$("$go_root/bin/go" version)" != "go version go${go_version} linux/${go_arch}" ]]; then
+  echo "Installing Go ${go_version}"
+  download_dir="$(mktemp -d)"
+  trap 'rm -rf "$download_dir"' EXIT
+  archive="go${go_version}.linux-${go_arch}.tar.gz"
+  checksum="$(curl --fail --silent --show-error --location --retry 3 'https://go.dev/dl/?mode=json&include=all' |
+    jq -er --arg archive "$archive" '[.[].files[] | select(.filename == $archive)][0].sha256')"
+  curl --fail --silent --show-error --location --retry 3 "https://go.dev/dl/$archive" -o "$download_dir/$archive"
+  printf '%s  %s\n' "$checksum" "$download_dir/$archive" | sha256sum --check
+  sudo mkdir -p "$go_root"
+  sudo tar -xzf "$download_dir/$archive" --strip-components=1 -C "$go_root"
+fi
+# /usr/local/bin is available to Amp and supervised services in fresh login shells.
+sudo ln -sfn "$go_root/bin/go" /usr/local/bin/go
+sudo ln -sfn "$go_root/bin/gofmt" /usr/local/bin/gofmt
+export PATH="/usr/local/bin:$PATH"
+go version
+echo "Go ready (${SECONDS}s elapsed)"
+
+echo 'Downloading modules from go.mod/go.sum'
+go mod download
+echo "Modules ready (${SECONDS}s elapsed)"
+
+echo 'Warming the Go build cache, including the embedded DuckDB driver'
+go build ./cmd/...
+echo "Setup finished (${SECONDS}s elapsed)"

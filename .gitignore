@@ -2,3 +2,4 @@
 *.duckdb
 *.duckdb.wal
 coverage.out
+.amp/portals/*

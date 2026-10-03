@@ -15,7 +15,7 @@ import (
 
 func TestStoreIngestAndQuery(t *testing.T) {
 	cfg := config.Load()
-	cfg.DatabasePath = filepath.Join(t.TempDir(), "test.duckdb")
+	cfg.DatabasePath = filepath.Join(t.TempDir(), "test.sqlite")
 	telemetryStore, err := Open(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -26,7 +26,7 @@ func TestStoreIngestAndQuery(t *testing.T) {
 	rootID, scope, kind := "root", "scope", "server"
 	spans := []model.SpanRecord{
 		{TraceID: "trace-1", SpanID: rootID, ServiceName: "api", ScopeName: &scope, Kind: &kind, OperationName: "GET /items", StartTimeMs: now, EndTimeMs: now + 100, DurationMs: 100, Status: "ok", Resource: map[string]string{"region": "west"}, Attributes: map[string]string{"http.method": "GET"}, Events: []model.EventRecord{}},
-		{TraceID: "trace-1", SpanID: "child", ParentSpanID: &rootID, ServiceName: "db", OperationName: "select items", StartTimeMs: now + 10, EndTimeMs: now + 90, DurationMs: 80, Status: "error", Resource: map[string]string{}, Attributes: map[string]string{"db.system": "duckdb"}, Events: []model.EventRecord{}},
+		{TraceID: "trace-1", SpanID: "child", ParentSpanID: &rootID, ServiceName: "db", OperationName: "select items", StartTimeMs: now + 10, EndTimeMs: now + 90, DurationMs: 80, Status: "error", Resource: map[string]string{}, Attributes: map[string]string{"db.system": "sqlite"}, Events: []model.EventRecord{}},
 	}
 	if inserted, err := telemetryStore.IngestSpans(context.Background(), spans); err != nil || inserted != 2 {
 		t.Fatalf("ingest spans: inserted=%d err=%v", inserted, err)
@@ -50,7 +50,7 @@ func TestStoreIngestAndQuery(t *testing.T) {
 		t.Fatalf("search logs: %#v, %v", matchedLogs, err)
 	}
 
-	summaries, err := telemetryStore.ListTraceSummaries(context.Background(), TraceFilter{Operation: "select", Attributes: map[string]string{"db.system": "duckdb"}, SinceMs: now - 1}, 10)
+	summaries, err := telemetryStore.ListTraceSummaries(context.Background(), TraceFilter{Operation: "select", Attributes: map[string]string{"db.system": "sqlite"}, SinceMs: now - 1}, 10)
 	if err != nil || len(summaries) != 1 || summaries[0].TraceID != "trace-1" {
 		t.Fatalf("search traces: %#v, %v", summaries, err)
 	}
@@ -59,7 +59,7 @@ func TestStoreIngestAndQuery(t *testing.T) {
 		t.Fatalf("search spans: %#v, %v", spansFound, err)
 	}
 	spansFound, err = telemetryStore.SearchSpans(context.Background(), SpanFilter{
-		Attributes: map[string]string{"db.system": "duckdb"}, AttributeContains: map[string]string{"db.system": "DUCK"}, SinceMs: now - 1,
+		Attributes: map[string]string{"db.system": "sqlite"}, AttributeContains: map[string]string{"db.system": "SQL"}, SinceMs: now - 1,
 	}, 10)
 	if err != nil || len(spansFound) != 1 || spansFound[0].Span.SpanID != "child" {
 		t.Fatalf("search spans with exact and contains filters on one key: %#v, %v", spansFound, err)
@@ -74,7 +74,7 @@ func TestStoreIngestAndQuery(t *testing.T) {
 
 func TestMissingParentCreatesSyntheticSpan(t *testing.T) {
 	cfg := config.Load()
-	cfg.DatabasePath = filepath.Join(t.TempDir(), "test.duckdb")
+	cfg.DatabasePath = filepath.Join(t.TempDir(), "test.sqlite")
 	telemetryStore, err := Open(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -109,7 +109,7 @@ func TestMissingParentCreatesSyntheticSpan(t *testing.T) {
 
 func TestTraceSummaryUsesOneCoherentRoot(t *testing.T) {
 	cfg := config.Load()
-	cfg.DatabasePath = filepath.Join(t.TempDir(), "test.duckdb")
+	cfg.DatabasePath = filepath.Join(t.TempDir(), "test.sqlite")
 	telemetryStore, err := Open(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -147,7 +147,7 @@ func TestTraceSummaryUsesOneCoherentRoot(t *testing.T) {
 
 func TestTraceWithoutExplicitRootUsesEarliestSpan(t *testing.T) {
 	cfg := config.Load()
-	cfg.DatabasePath = filepath.Join(t.TempDir(), "test.duckdb")
+	cfg.DatabasePath = filepath.Join(t.TempDir(), "test.sqlite")
 	telemetryStore, err := Open(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -183,7 +183,7 @@ func TestIngestBatchesSpansAndLogsInOneWrite(t *testing.T) {
 		t.Fatalf("write interval=%s, want 500ms", writeBatchInterval)
 	}
 	cfg := config.Load()
-	cfg.DatabasePath = filepath.Join(t.TempDir(), "batch.duckdb")
+	cfg.DatabasePath = filepath.Join(t.TempDir(), "batch.sqlite")
 	telemetryStore, err := openWithBatchInterval(cfg, time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -211,9 +211,7 @@ func TestIngestBatchesSpansAndLogsInOneWrite(t *testing.T) {
 	mustFlush(t, telemetryStore)
 	assertTableCount(t, telemetryStore, "spans", 25)
 	assertTableCount(t, telemetryStore, "logs", 25)
-	telemetryStore.pendingMu.Lock()
-	batches := telemetryStore.committedBatches
-	telemetryStore.pendingMu.Unlock()
+	batches := telemetryStore.Stats().CommittedBatches
 	if batches != 1 {
 		t.Fatalf("committed batches=%d, want 1", batches)
 	}
@@ -221,7 +219,7 @@ func TestIngestBatchesSpansAndLogsInOneWrite(t *testing.T) {
 
 func TestWriterFlushesOnInterval(t *testing.T) {
 	cfg := config.Load()
-	cfg.DatabasePath = filepath.Join(t.TempDir(), "interval.duckdb")
+	cfg.DatabasePath = filepath.Join(t.TempDir(), "interval.sqlite")
 	telemetryStore, err := openWithBatchInterval(cfg, 20*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
@@ -250,7 +248,7 @@ func TestWriterFlushesOnInterval(t *testing.T) {
 
 func TestIngestOwnsQueuedRecords(t *testing.T) {
 	cfg := config.Load()
-	cfg.DatabasePath = filepath.Join(t.TempDir(), "ownership.duckdb")
+	cfg.DatabasePath = filepath.Join(t.TempDir(), "ownership.sqlite")
 	telemetryStore, err := openWithBatchInterval(cfg, time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -304,7 +302,7 @@ func TestIngestOwnsQueuedRecords(t *testing.T) {
 
 func TestCloseFlushesAndRejectsFurtherIngest(t *testing.T) {
 	cfg := config.Load()
-	cfg.DatabasePath = filepath.Join(t.TempDir(), "close.duckdb")
+	cfg.DatabasePath = filepath.Join(t.TempDir(), "close.sqlite")
 	telemetryStore, err := openWithBatchInterval(cfg, time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -319,8 +317,8 @@ func TestCloseFlushesAndRejectsFurtherIngest(t *testing.T) {
 	if err := telemetryStore.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := telemetryStore.IngestLogs(context.Background(), []model.LogRecord{{ServiceName: "closed"}}); !errors.Is(err, errStoreClosed) {
-		t.Fatalf("ingest after close error=%v, want %v", err, errStoreClosed)
+	if _, err := telemetryStore.IngestLogs(context.Background(), []model.LogRecord{{ServiceName: "closed"}}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("ingest after close error=%v, want %v", err, ErrClosed)
 	}
 
 	reopened, err := openWithBatchInterval(cfg, time.Hour)
@@ -336,7 +334,7 @@ func TestCloseFlushesAndRejectsFurtherIngest(t *testing.T) {
 
 func TestConcurrentIngestFlushAndCleanup(t *testing.T) {
 	cfg := config.Load()
-	cfg.DatabasePath = filepath.Join(t.TempDir(), "concurrent.duckdb")
+	cfg.DatabasePath = filepath.Join(t.TempDir(), "concurrent.sqlite")
 	telemetryStore, err := openWithBatchInterval(cfg, 2*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)

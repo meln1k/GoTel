@@ -14,7 +14,7 @@ import (
 
 func TestAIAnalyticsAndFacets(t *testing.T) {
 	cfg := config.Load()
-	cfg.DatabasePath = filepath.Join(t.TempDir(), "analytics.duckdb")
+	cfg.DatabasePath = filepath.Join(t.TempDir(), "analytics.sqlite")
 	telemetryStore, err := Open(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -70,7 +70,7 @@ func TestAIAnalyticsAndFacets(t *testing.T) {
 
 func TestCleanupPreservesRunningTraces(t *testing.T) {
 	cfg := config.Load()
-	cfg.DatabasePath = filepath.Join(t.TempDir(), "retention.duckdb")
+	cfg.DatabasePath = filepath.Join(t.TempDir(), "retention.sqlite")
 	cfg.RetentionHours = 1
 	telemetryStore, err := Open(cfg)
 	if err != nil {
@@ -106,9 +106,11 @@ func TestCleanupPreservesRunningTraces(t *testing.T) {
 	}
 }
 
-func TestCleanupUsesDuckDBLiveSize(t *testing.T) {
+func TestCleanupUsesLiveSize(t *testing.T) {
 	cfg := config.Load()
-	cfg.DatabasePath = filepath.Join(t.TempDir(), "size.duckdb")
+	cfg.DatabasePath = filepath.Join(t.TempDir(), "size.sqlite")
+	// This retention fixture deliberately stores multi-megabyte payloads.
+	cfg.MaxBatchBytes = 32 << 20
 	cfg.MaxDBSizeMB = 1
 	cfg.RetentionHours = 24
 	cfg.RetentionLogBatch = 1

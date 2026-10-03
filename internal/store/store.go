@@ -13,8 +13,6 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/duckdb/duckdb-go/v2"
-
 	"github.com/meln1k/gotel/internal/config"
 	"github.com/meln1k/gotel/internal/model"
 )
@@ -24,32 +22,48 @@ type Store struct {
 	config  config.Config
 	writeMu sync.Mutex
 
-	pendingMu    sync.Mutex
-	pendingSpans []model.SpanRecord
-	pendingLogs  []model.LogRecord
-	closed       bool
-	flushCh      chan chan error
-	stopCh       chan struct{}
-	doneCh       chan struct{}
-	shutdownErr  error
-	closeOnce    sync.Once
-
-	committedBatches uint64
+	pendingMu                      sync.Mutex
+	queue                          []queuedRecord
+	head, count                    int
+	bytes                          int
+	nextSeq, completedSeq          uint64
+	inFlightRecords, inFlightBytes int
+	closed                         bool
+	changed                        chan struct{}
+	wakeCh                         chan struct{}
+	stopCh                         chan struct{}
+	doneCh                         chan struct{}
+	closeDone                      chan struct{}
+	writerCtx                      context.Context
+	cancelWriter                   context.CancelFunc
+	shutdownErr                    error
+	closeOnce                      sync.Once
+	stats                          PersistenceStats
+	firstDiscardSeq                uint64
+	discardError                   error
+	lastFailureLog, lastDiscardLog time.Time
+	// Set before admission by deterministic tests; production uses writeBatch.
+	persist func(context.Context, []model.SpanRecord, []model.LogRecord) error
 }
 
 const writeBatchInterval = 500 * time.Millisecond
-
-var errStoreClosed = errors.New("store is closed")
 
 func Open(cfg config.Config) (*Store, error) {
 	return openWithBatchInterval(cfg, writeBatchInterval)
 }
 
 func openWithBatchInterval(cfg config.Config, interval time.Duration) (*Store, error) {
+	if err := cfg.ValidateIngestion(); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0o755); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("duckdb", cfg.DatabasePath)
+	dsn, err := sqliteDSN(cfg.DatabasePath)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("gotel_sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -57,94 +71,26 @@ func openWithBatchInterval(cfg config.Config, interval time.Duration) (*Store, e
 	db.SetMaxIdleConns(8)
 	store := &Store{
 		db: db, config: cfg,
-		flushCh: make(chan chan error), stopCh: make(chan struct{}), doneCh: make(chan struct{}),
+		queue: make([]queuedRecord, cfg.MaxOutstandingRecords), changed: make(chan struct{}),
+		wakeCh: make(chan struct{}, 1), stopCh: make(chan struct{}), doneCh: make(chan struct{}), closeDone: make(chan struct{}),
 	}
 	if err := store.initialize(context.Background()); err != nil {
 		db.Close()
 		return nil, err
 	}
+	store.writerCtx, store.cancelWriter = context.WithCancel(context.Background())
 	go store.runWriter(interval)
 	return store, nil
 }
 
-func (s *Store) Close() error {
-	s.closeOnce.Do(func() {
-		s.pendingMu.Lock()
-		s.closed = true
-		s.pendingMu.Unlock()
-		close(s.stopCh)
-		<-s.doneCh
-		s.shutdownErr = errors.Join(s.shutdownErr, s.db.Close())
-	})
-	return s.shutdownErr
-}
-
-// Flush waits until all telemetry accepted before the call has been written.
-func (s *Store) Flush(ctx context.Context) error {
-	result := make(chan error, 1)
-	select {
-	case s.flushCh <- result:
-	case <-s.doneCh:
-		return errStoreClosed
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	select {
-	case err := <-result:
-		return err
-	case <-s.doneCh:
-		return errStoreClosed
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (s *Store) runWriter(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	defer close(s.doneCh)
-	for {
-		select {
-		case <-ticker.C:
-			_ = s.flushPending()
-		case result := <-s.flushCh:
-			result <- s.flushPending()
-		case <-s.stopCh:
-			s.shutdownErr = s.flushPending()
-			return
-		}
-	}
-}
-
-func (s *Store) flushPending() error {
-	s.pendingMu.Lock()
-	spans, logs := s.pendingSpans, s.pendingLogs
-	s.pendingSpans, s.pendingLogs = nil, nil
-	s.pendingMu.Unlock()
-	if len(spans) == 0 && len(logs) == 0 {
-		return nil
-	}
-	s.writeMu.Lock()
-	err := s.writeBatch(context.Background(), spans, logs)
-	s.writeMu.Unlock()
-	if err == nil {
-		s.pendingMu.Lock()
-		s.committedBatches++
-		s.pendingMu.Unlock()
-		return nil
-	}
-	s.pendingMu.Lock()
-	requeuedSpans := make([]model.SpanRecord, 0, len(spans)+len(s.pendingSpans))
-	requeuedSpans = append(requeuedSpans, spans...)
-	s.pendingSpans = append(requeuedSpans, s.pendingSpans...)
-	requeuedLogs := make([]model.LogRecord, 0, len(logs)+len(s.pendingLogs))
-	requeuedLogs = append(requeuedLogs, logs...)
-	s.pendingLogs = append(requeuedLogs, s.pendingLogs...)
-	s.pendingMu.Unlock()
-	return err
-}
-
 func (s *Store) initialize(ctx context.Context) error {
+	var journal string
+	if err := s.db.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journal); err != nil {
+		return err
+	}
+	if journal != "wal" {
+		return fmt.Errorf("SQLite requires WAL mode, got %s", journal)
+	}
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS spans (
 			trace_id VARCHAR NOT NULL,
@@ -163,9 +109,8 @@ func (s *Store) initialize(ctx context.Context) error {
 			events_json VARCHAR NOT NULL,
 			PRIMARY KEY (trace_id, span_id)
 		)`,
-		`CREATE SEQUENCE IF NOT EXISTS logs_id_seq START 1`,
 		`CREATE TABLE IF NOT EXISTS logs (
-			id BIGINT PRIMARY KEY DEFAULT nextval('logs_id_seq'),
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			trace_id VARCHAR,
 			span_id VARCHAR,
 			service_name VARCHAR NOT NULL,
@@ -221,41 +166,14 @@ func (s *Store) initialize(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) IngestSpans(ctx context.Context, spans []model.SpanRecord) (int, error) {
-	if len(spans) == 0 {
-		return 0, nil
-	}
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	spans = cloneSpanRecords(spans)
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	if s.closed {
-		return 0, errStoreClosed
-	}
-	s.pendingSpans = append(s.pendingSpans, spans...)
-	return len(spans), nil
-}
-
-func (s *Store) IngestLogs(ctx context.Context, logs []model.LogRecord) (int, error) {
-	if len(logs) == 0 {
-		return 0, nil
-	}
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	logs = cloneLogRecords(logs)
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	if s.closed {
-		return 0, errStoreClosed
-	}
-	s.pendingLogs = append(s.pendingLogs, logs...)
-	return len(logs), nil
-}
-
 func (s *Store) writeBatch(ctx context.Context, spans []model.SpanRecord, logs []model.LogRecord) error {
+	var summaryTime time.Duration
+	defer func() {
+		s.pendingMu.Lock()
+		s.stats.LastSummaryDurationMs = float64(summaryTime) / float64(time.Millisecond)
+		s.stats.TotalSummaryDurationMs += float64(summaryTime) / float64(time.Millisecond)
+		s.pendingMu.Unlock()
+	}()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -294,15 +212,17 @@ func (s *Store) writeBatch(ctx context.Context, spans []model.SpanRecord, logs [
 		if _, err := tx.ExecContext(ctx, `DELETE FROM span_attributes WHERE trace_id=? AND span_id=?`, span.TraceID, span.SpanID); err != nil {
 			return err
 		}
-		for key, value := range merged(span.Resource, span.Attributes) {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO span_attributes (trace_id, span_id, key, value) VALUES (?, ?, ?, ?)`, span.TraceID, span.SpanID, key, value); err != nil {
-				return err
-			}
+		if err := insertAttributes(ctx, tx, `INSERT INTO span_attributes (trace_id, span_id, key, value) VALUES `,
+			[]any{span.TraceID, span.SpanID}, merged(span.Resource, span.Attributes)); err != nil {
+			return err
 		}
 		touched[span.TraceID] = struct{}{}
 	}
 	for traceID := range touched {
-		if err := refreshSummary(ctx, tx, traceID); err != nil {
+		started := time.Now()
+		err := s.refreshSummary(ctx, tx, traceID)
+		summaryTime += time.Since(started)
+		if err != nil {
 			return err
 		}
 	}
@@ -323,26 +243,44 @@ func (s *Store) writeBatch(ctx context.Context, spans []model.SpanRecord, logs [
 		if err != nil {
 			return err
 		}
-		for key, value := range merged(record.Resource, record.Attributes) {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO log_attributes (log_id, key, value) VALUES (?, ?, ?)`, id, key, value); err != nil {
-				return err
-			}
+		if err := insertAttributes(ctx, tx, `INSERT INTO log_attributes (log_id, key, value) VALUES `,
+			[]any{id}, merged(record.Resource, record.Attributes)); err != nil {
+			return err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return nil
+	return tx.Commit()
 }
 
-func refreshSummary(ctx context.Context, tx *sql.Tx, traceID string) error {
+// One statement per record replaces one per attribute. Admission's byte/work
+// limits bound its SQL/parameters; the record and summary still commit atomically.
+func insertAttributes(ctx context.Context, tx *sql.Tx, prefix string, identity []any, attributes map[string]string) error {
+	if len(attributes) == 0 {
+		return nil
+	}
+	row := "(" + strings.TrimSuffix(strings.Repeat("?,", len(identity)+2), ",") + ")"
+	query := prefix + strings.TrimSuffix(strings.Repeat(row+",", len(attributes)), ",")
+	args := make([]any, 0, len(attributes)*(len(identity)+2))
+	for key, value := range attributes {
+		args = append(args, identity...)
+		args = append(args, key, value)
+	}
+	_, err := tx.ExecContext(ctx, query, args...)
+	return err
+}
+
+func (s *Store) refreshSummary(ctx context.Context, tx *sql.Tx, traceID string) error {
+	var facts traceFacts
+	defer func() {
+		s.pendingMu.Lock()
+		s.stats.SummaryRowsScanned += uint64(facts.spanCount)
+		s.pendingMu.Unlock()
+	}()
 	rows, err := tx.QueryContext(ctx, `SELECT parent_span_id, service_name, operation_name, start_time_ms, end_time_ms, status
 		FROM spans WHERE trace_id=? ORDER BY start_time_ms ASC, span_id ASC`, traceID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	var facts traceFacts
 	for rows.Next() {
 		var parent sql.NullString
 		var service, operation, status string
@@ -710,33 +648,24 @@ func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
 		return err
 	}
 	if changed {
-		_, err = s.db.ExecContext(ctx, `CHECKPOINT`)
-		return err
+		return s.checkpoint(ctx)
 	}
 	return nil
 }
 
+func (s *Store) checkpoint(ctx context.Context) error {
+	// PASSIVE never waits for readers. Free pages are reused; no VACUUM
+	// or truncation in the ingestion/maintenance writer's critical path.
+	_, err := s.db.ExecContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)")
+	return err
+}
+
 func (s *Store) exceedsSizeLimit(ctx context.Context) (bool, error) {
 	limit := int64(s.config.MaxDBSizeMB) * 1024 * 1024
-	physicalSize := int64(0)
-	for _, path := range []string{s.config.DatabasePath, s.config.DatabasePath + ".wal"} {
-		if info, err := os.Stat(path); err == nil {
-			physicalSize += info.Size()
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return false, err
-		}
-	}
-	if physicalSize <= limit {
-		return false, nil
-	}
-	if _, err := s.db.ExecContext(ctx, `CHECKPOINT`); err != nil {
-		return false, err
-	}
 	var liveBytes int64
-	if err := s.db.QueryRowContext(ctx, `SELECT coalesce(sum(used_blocks * block_size), 0) FROM pragma_database_size()`).Scan(&liveBytes); err != nil {
-		return false, err
-	}
-	return liveBytes > limit, nil
+	err := s.db.QueryRowContext(ctx, `SELECT (p.page_count-f.freelist_count)*s.page_size
+		FROM pragma_page_count() p, pragma_freelist_count() f, pragma_page_size() s`).Scan(&liveBytes)
+	return liveBytes > limit, err
 }
 
 func (s *Store) RunMaintenance(ctx context.Context) {

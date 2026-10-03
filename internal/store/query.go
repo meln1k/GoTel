@@ -204,7 +204,7 @@ func (s *Store) SearchSpans(ctx context.Context, filter SpanFilter, requestedLim
 	if filter.ParentOperation != "" {
 		parentJoin = `LEFT JOIN spans parent ON parent.trace_id=c.trace_id AND parent.span_id=c.parent_span_id`
 		parentCondition = `WHERE c.parent_span_id IS NOT NULL AND c.parent_span_id<>'' AND contains(lower(
-			CASE WHEN parent.span_id IS NULL THEN '[missing parent ' || left(c.parent_span_id, 8) || ']' ELSE parent.operation_name END
+			CASE WHEN parent.span_id IS NULL THEN '[missing parent ' || substr(c.parent_span_id, 1, 8) || ']' ELSE parent.operation_name END
 		), lower(?))`
 		args = append(args, filter.ParentOperation)
 	}

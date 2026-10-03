@@ -1,5 +1,6 @@
 /bin/
-*.duckdb
-*.duckdb.wal
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 coverage.out
 .amp/portals/*

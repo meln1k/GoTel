@@ -3,4 +3,4 @@ set -euo pipefail
 
 # Toolchains and caches persist in snapshots; no services or authentication are needed.
 go version
-command -v gcc g++ >/dev/null
+command -v gcc >/dev/null

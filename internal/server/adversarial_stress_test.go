@@ -28,6 +28,7 @@ import (
 	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
 	resourcev1 "go.opentelemetry.io/proto/otlp/resource/v1"
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
+	statuspb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/meln1k/gotel/internal/config"
@@ -48,11 +49,12 @@ const (
 //	go test -tags=stress ./internal/server -run TestAdversarialHTTPAndStoreStress -count=1
 func TestAdversarialHTTPAndStoreStress(t *testing.T) {
 	cfg := config.Load()
-	cfg.DatabasePath = filepath.Join(t.TempDir(), "adversarial.duckdb")
+	cfg.DatabasePath = filepath.Join(t.TempDir(), "adversarial.sqlite")
 	cfg.RetentionHours = 24
 	cfg.RetentionTraceBatch = 16
 	cfg.RetentionLogBatch = 32
 	cfg.MaxDBSizeMB = 1024
+	cfg.MaxConcurrentIngest = stressWorkers // This suite tests accepted traffic; overload is covered separately.
 
 	telemetryStore, err := store.Open(cfg)
 	if err != nil {
@@ -398,8 +400,8 @@ func runMalformedRequestMatrix(t *testing.T, client *http.Client, baseURL string
 		body                      []byte
 		status                    int
 	}{
-		{http.MethodPost, "/v1/traces", "application/json", []byte(`{"resourceSpans":[`), http.StatusInternalServerError},
-		{http.MethodPost, "/v1/logs", "application/x-protobuf", []byte{0xff, 0xff}, http.StatusInternalServerError},
+		{http.MethodPost, "/v1/traces", "application/json", []byte(`{"resourceSpans":[`), http.StatusBadRequest},
+		{http.MethodPost, "/v1/logs", "application/x-protobuf", []byte{0xff, 0xff}, http.StatusBadRequest},
 		{http.MethodPost, "/v1/traces", "application/json", []byte(`{"resourceSpans":[]}`), http.StatusOK},
 		{http.MethodGet, "/api/traces/stats?groupBy=service&agg=drop_table", "", nil, http.StatusBadRequest},
 		{http.MethodGet, "/api/logs/stats?groupBy=service", "", nil, http.StatusBadRequest},
@@ -432,6 +434,13 @@ func runMalformedRequestMatrix(t *testing.T, client *http.Client, baseURL string
 		}
 		if response.StatusCode != test.status {
 			t.Errorf("%s %s returned %d, want %d: %s", test.method, test.path, response.StatusCode, test.status, body)
+		}
+		if protobufContent(test.contentType) {
+			var status statuspb.Status
+			if err := proto.Unmarshal(body, &status); err != nil || status.Code != 3 {
+				t.Errorf("%s %s returned invalid protobuf status: %v %v", test.method, test.path, &status, err)
+			}
+			continue
 		}
 		if !strings.HasPrefix(response.Header.Get("Content-Type"), "application/json") {
 			t.Errorf("%s %s returned content type %q", test.method, test.path, response.Header.Get("Content-Type"))
@@ -699,6 +708,17 @@ func postTelemetry(client *http.Client, requestURL, contentType string, payload 
 	if response.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 		return fmt.Errorf("POST %s returned %d: %s", requestURL, response.StatusCode, body)
+	}
+	if protobufContent(contentType) {
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			return err
+		}
+		var result proto.Message = &collectortracev1.ExportTraceServiceResponse{}
+		if countField == "insertedLogs" {
+			result = &collectorlogsv1.ExportLogsServiceResponse{}
+		}
+		return proto.Unmarshal(body, result)
 	}
 	var result map[string]int
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {

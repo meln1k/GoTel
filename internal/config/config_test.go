@@ -1,6 +1,22 @@
 package config
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
+
+func TestDatabasePath(t *testing.T) {
+	t.Setenv("GOTEL_RUNTIME_DIR", t.TempDir())
+	t.Setenv("GOTEL_OTEL_DB_PATH", "")
+	cfg := Load()
+	if err := cfg.ValidateIngestion(); err != nil || cfg.DatabasePath != filepath.Join(cfg.StateDir, "telemetry.sqlite") {
+		t.Fatalf("path=%q err=%v", cfg.DatabasePath, err)
+	}
+	t.Setenv("GOTEL_OTEL_DB_PATH", "/tmp/custom.db")
+	if got := Load().DatabasePath; got != "/tmp/custom.db" {
+		t.Fatalf("custom path ignored: %q", got)
+	}
+}
 
 func TestLoadURLPrecedenceAndOverrides(t *testing.T) {
 	t.Setenv("GOTEL_RUNTIME_DIR", t.TempDir())
@@ -99,5 +115,66 @@ func TestSelfTelemetryEndpointPrecedence(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 	if got := Load().TelemetryURL; got != "http://renamed.example/fallback" {
 		t.Fatalf("renamed endpoint fallback was not used: %q", got)
+	}
+}
+
+func TestIngestionDefaultsAndValidation(t *testing.T) {
+	var zero Config
+	for _, setting := range zero.ingestionSettings() {
+		t.Setenv(setting.name, "")
+	}
+	cfg := Load()
+	if err := cfg.ValidateIngestion(); err != nil {
+		t.Fatal(err)
+	}
+	for _, setting := range cfg.ingestionSettings() {
+		if *setting.value != setting.fallback {
+			t.Errorf("%s = %d, want %d", setting.name, *setting.value, setting.fallback)
+		}
+	}
+	if err := zero.ValidateIngestion(); err == nil {
+		t.Fatal("direct zero-valued configuration must be rejected")
+	}
+	for _, setting := range cfg.ingestionSettings() {
+		for _, raw := range []string{"0", "-1", "5seconds", "1.5", "no", "999999999999999999999999999999999"} {
+			t.Run(setting.name+"/"+raw, func(t *testing.T) {
+				t.Setenv(setting.name, raw)
+				if err := Load().ValidateIngestion(); err == nil {
+					t.Fatalf("accepted invalid %s=%q", setting.name, raw)
+				}
+			})
+		}
+		old := *setting.value
+		*setting.value = setting.maximum + 1
+		if err := cfg.ValidateIngestion(); err == nil {
+			t.Errorf("accepted impractical %s", setting.name)
+		}
+		*setting.value = old
+	}
+	tooMany := cfg
+	tooMany.MaxBatchRecords = cfg.MaxOutstandingRecords + 1
+	if err := tooMany.ValidateIngestion(); err == nil {
+		t.Fatal("batch records may not exceed outstanding records")
+	}
+	tooBig := cfg
+	tooBig.MaxBatchBytes = cfg.MaxOutstandingBytes + 1
+	if err := tooBig.ValidateIngestion(); err == nil {
+		t.Fatal("batch bytes may not exceed outstanding bytes")
+	}
+}
+
+func TestIngestionEnvironmentOverrides(t *testing.T) {
+	var zero Config
+	for _, setting := range zero.ingestionSettings() {
+		t.Setenv(setting.name, " 42 ")
+	}
+	cfg := LoadManaged()
+	if err := cfg.ValidateIngestion(); err != nil {
+		t.Fatal(err)
+	}
+	for _, setting := range cfg.ingestionSettings() {
+		if *setting.value != 42 {
+			t.Errorf("%s = %d, want 42", setting.name, *setting.value)
+		}
 	}
 }

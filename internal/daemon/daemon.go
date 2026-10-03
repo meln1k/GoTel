@@ -22,20 +22,24 @@ import (
 )
 
 type Status struct {
-	Running      bool    `json:"running"`
-	Managed      bool    `json:"managed"`
-	Service      *string `json:"service"`
-	PID          *int    `json:"pid"`
-	URL          string  `json:"url"`
-	DatabasePath string  `json:"databasePath"`
-	Workdir      *string `json:"workdir"`
-	StartedAt    *string `json:"startedAt"`
-	Version      *string `json:"version"`
-	SameWorkdir  bool    `json:"sameWorkdir"`
-	Reason       *string `json:"reason"`
-	LogPath      string  `json:"logPath"`
-	LockPath     string  `json:"lockPath"`
-	RegistryPID  *int    `json:"registryPid"`
+	Running                bool            `json:"running"`
+	Ready                  bool            `json:"ready"`
+	Persistence            json.RawMessage `json:"persistence,omitempty"`
+	ShutdownTimeoutSeconds int             `json:"shutdownTimeoutSeconds,omitempty"`
+	Managed                bool            `json:"managed"`
+	Service                *string         `json:"service"`
+	PID                    *int            `json:"pid"`
+	URL                    string          `json:"url"`
+	DatabasePath           string          `json:"databasePath"`
+	DatabaseBackend        string          `json:"databaseBackend"`
+	Workdir                *string         `json:"workdir"`
+	StartedAt              *string         `json:"startedAt"`
+	Version                *string         `json:"version"`
+	SameWorkdir            bool            `json:"sameWorkdir"`
+	Reason                 *string         `json:"reason"`
+	LogPath                string          `json:"logPath"`
+	LockPath               string          `json:"lockPath"`
+	RegistryPID            *int            `json:"registryPid"`
 }
 
 func LogPath(cfg config.Config) string  { return filepath.Join(cfg.StateDir, "daemon.log") }
@@ -70,7 +74,11 @@ func GetStatus(ctx context.Context, cfg config.Config) Status {
 	}
 	service, pid, workdir, startedAt, version := health.Service, health.PID, health.Workdir, health.StartedAt, health.Version
 	status.Service, status.PID = &service, &pid
+	status.Ready, status.Persistence = health.Ready, health.Persistence
+	status.ShutdownTimeoutSeconds = health.ShutdownTimeoutSeconds
 	status.URL, status.DatabasePath = health.URL, health.DatabasePath
+	backend := health.DatabaseBackend
+	status.DatabaseBackend = backend
 	status.Workdir, status.StartedAt, status.Version = &workdir, &startedAt, &version
 	current, _ := os.Getwd()
 	status.SameWorkdir = samePath(current, workdir)
@@ -81,6 +89,11 @@ func GetStatus(ctx context.Context, cfg config.Config) Status {
 	}
 	if health.DatabasePath != cfg.DatabasePath {
 		reason := fmt.Sprintf("port %d is serving Gotel with %s, expected %s", cfg.Port, health.DatabasePath, cfg.DatabasePath)
+		status.Reason = &reason
+		return status
+	}
+	if backend != "sqlite" {
+		reason := fmt.Sprintf("port %d is serving backend %q, expected sqlite", cfg.Port, backend)
 		status.Reason = &reason
 		return status
 	}
@@ -97,6 +110,9 @@ func GetStatus(ctx context.Context, cfg config.Config) Status {
 }
 
 func Ensure(ctx context.Context, cfg config.Config) (Status, error) {
+	if err := cfg.ValidateIngestion(); err != nil {
+		return downStatus(cfg), err
+	}
 	if status := GetStatus(ctx, cfg); status.Running {
 		if status.Managed {
 			return status, nil
@@ -182,7 +198,7 @@ func Stop(ctx context.Context, cfg config.Config) (Status, error) {
 	if err := process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return status, err
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(managedStopGrace(cfg, status.ShutdownTimeoutSeconds))
 	for registry.Alive(pid) && time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -191,10 +207,39 @@ func Stop(ctx context.Context, cfg config.Config) (Status, error) {
 		}
 	}
 	if registry.Alive(pid) {
-		_ = process.Signal(syscall.SIGKILL)
+		killErr := process.Signal(syscall.SIGKILL)
+		if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+			return status, fmt.Errorf("managed daemon exceeded shutdown grace; force kill failed: %w", killErr)
+		}
+		// Bound the post-kill wait as well; never report forced termination as a clean drain.
+		deadline = time.Now().Add(2 * time.Second)
+		for registry.Alive(pid) && time.Now().Before(deadline) {
+			select {
+			case <-ctx.Done():
+				return status, errors.Join(errors.New("managed daemon required force killing; telemetry may be lost"), ctx.Err())
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+		if !registry.Alive(pid) {
+			_ = registry.Remove(cfg.StateDir, pid)
+		}
+		return GetStatus(ctx, cfg), errors.New("managed daemon required force killing; telemetry may be lost")
 	}
 	_ = registry.Remove(cfg.StateDir, pid)
 	return GetStatus(ctx, cfg), nil
+}
+
+func managedStopGrace(cfg config.Config, advertisedSeconds int) time.Duration {
+	seconds := cfg.ShutdownTimeoutSeconds
+	if seconds <= 0 || seconds > 300 {
+		seconds = 20 // Stop must still work with invalid local configuration.
+	}
+	// The CLI may have different environment overrides from the running server.
+	if advertisedSeconds > 0 && advertisedSeconds <= 300 {
+		seconds = max(seconds, advertisedSeconds)
+	}
+	// HTTP shutdown + telemetry shutdown + store drain + scheduling margin.
+	return time.Duration(seconds)*time.Second + 5*time.Second + 5*time.Second + 5*time.Second
 }
 
 func Restart(ctx context.Context, cfg config.Config) (Status, error) {
@@ -242,7 +287,7 @@ func RunServer(ctx context.Context, cfg config.Config) (runErr error) {
 }
 
 func downStatus(cfg config.Config) Status {
-	return Status{URL: cfg.BaseURL, DatabasePath: cfg.DatabasePath, LogPath: LogPath(cfg), LockPath: LockPath(cfg)}
+	return Status{URL: cfg.BaseURL, DatabasePath: cfg.DatabasePath, DatabaseBackend: "sqlite", LogPath: LogPath(cfg), LockPath: LockPath(cfg)}
 }
 
 func acquireLock(ctx context.Context, cfg config.Config) (func(), error) {

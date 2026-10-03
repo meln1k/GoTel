@@ -172,16 +172,17 @@ func TestSQLQueriesPreserveCandidateAndStatsCaps(t *testing.T) {
 	t.Run("five-thousand-row-stats-window", func(t *testing.T) {
 		telemetryStore := emptyDifferentialStore(t)
 		base := time.Now().Add(-time.Hour).UnixMilli()
+		fixtureRows := `(WITH RECURSIVE r(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM r WHERE i<5000) SELECT i FROM r) AS r`
 		_, err := telemetryStore.db.ExecContext(ctx, `INSERT INTO trace_summaries
-			SELECT 'cap-trace-' || lpad(i::VARCHAR, 5, '0'), CASE WHEN i=0 THEN 'old' ELSE 'new' END,
-				'cap operation', ? + i, ? + i + 1, 0, 1, 1, 0 FROM range(5001) AS r(i)`, base, base)
+			SELECT 'cap-trace-' || printf('%05d', i), CASE WHEN i=0 THEN 'old' ELSE 'new' END,
+				'cap operation', ? + i, ? + i + 1, 0, 1, 1, 0 FROM `+fixtureRows, base, base)
 		if err != nil {
 			t.Fatal(err)
 		}
 		_, err = telemetryStore.db.ExecContext(ctx, `INSERT INTO spans
-			SELECT 'cap-trace-' || lpad(i::VARCHAR, 5, '0'), 'cap-span-' || lpad(i::VARCHAR, 5, '0'), NULL,
+			SELECT 'cap-trace-' || printf('%05d', i), 'cap-span-' || printf('%05d', i), NULL,
 				CASE WHEN i=0 THEN 'old' ELSE 'new' END, NULL, 'cap operation', NULL,
-				? + i, ? + i + 1, 1, 'ok', '{}', '{}', '[]' FROM range(5001) AS r(i)`, base, base)
+				? + i, ? + i + 1, 1, 'ok', '{}', '{}', '[]' FROM `+fixtureRows, base, base)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -199,7 +200,7 @@ func TestSQLQueriesPreserveCandidateAndStatsCaps(t *testing.T) {
 		_, err = telemetryStore.db.ExecContext(ctx, `INSERT INTO logs
 			(trace_id, span_id, service_name, scope_name, severity_text, timestamp_ms, body, attributes_json, resource_json)
 			SELECT NULL, NULL, CASE WHEN i=0 THEN 'old' ELSE 'new' END, NULL, 'INFO', ? + i,
-				'cap log', '{"cap":"yes"}', '{}' FROM range(5001) AS r(i)`, base)
+				'cap log', '{"cap":"yes"}', '{}' FROM `+fixtureRows, base)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -291,7 +292,7 @@ func differentialStore(t *testing.T) (*Store, int64) {
 func emptyDifferentialStore(t *testing.T) *Store {
 	t.Helper()
 	cfg := config.Load()
-	cfg.DatabasePath = filepath.Join(t.TempDir(), "differential.duckdb")
+	cfg.DatabasePath = filepath.Join(t.TempDir(), "differential.sqlite")
 	telemetryStore, err := Open(cfg)
 	if err != nil {
 		t.Fatal(err)

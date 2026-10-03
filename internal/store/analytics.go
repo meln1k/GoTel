@@ -38,7 +38,7 @@ func (s *Store) TraceStats(ctx context.Context, groupBy, aggregate string, filte
 	args = append(args, groupArgs...)
 	cte := `WITH filtered AS (
 		SELECT t.trace_id, t.service_name, t.root_operation_name,
-			CASE WHEN t.active_span_count>0 THEN greatest(0, ?-t.started_at_ms)::DOUBLE ELSE t.duration_ms END AS duration_ms,
+			CASE WHEN t.active_span_count>0 THEN CAST(greatest(0, ?-t.started_at_ms) AS DOUBLE) ELSE t.duration_ms END AS duration_ms,
 			t.error_count
 		FROM trace_summaries t WHERE ` + where + `
 		ORDER BY t.started_at_ms DESC, t.trace_id DESC LIMIT ?
@@ -76,7 +76,7 @@ func (s *Store) LogStats(ctx context.Context, groupBy string, filter LogFilter, 
 	), bucketed AS (
 		SELECT `+groupExpression+` AS group_name FROM filtered f
 	)
-	SELECT group_name, count(*)::DOUBLE AS value, count(*) AS item_count FROM bucketed
+	SELECT group_name, CAST(count(*) AS DOUBLE) AS value, count(*) AS item_count FROM bucketed
 	GROUP BY group_name ORDER BY value DESC, group_name ASC LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
@@ -94,7 +94,7 @@ func (s *Store) aggregateStats(ctx context.Context, cte, aggregate string, limit
 			FROM bucketed
 		)
 		SELECT group_name,
-			max(CASE WHEN duration_rank=ceil(item_count*0.95)::BIGINT THEN duration_ms END) AS value,
+			max(CASE WHEN duration_rank=CAST(ceil(item_count*0.95) AS BIGINT) THEN duration_ms END) AS value,
 			max(item_count) AS item_count
 		FROM ranked GROUP BY group_name ORDER BY value DESC, group_name ASC LIMIT ?`, args...)
 		if err != nil {
@@ -102,12 +102,12 @@ func (s *Store) aggregateStats(ctx context.Context, cte, aggregate string, limit
 		}
 		return scanStats(rows)
 	}
-	expression := "count(*)::DOUBLE"
+	expression := "CAST(count(*) AS DOUBLE)"
 	switch aggregate {
 	case "avg_duration":
 		expression = "avg(duration_ms)"
 	case "error_rate":
-		expression = "sum(CASE WHEN error_count>0 THEN 1 ELSE 0 END)::DOUBLE/count(*)"
+		expression = "CAST(sum(CASE WHEN error_count>0 THEN 1 ELSE 0 END) AS DOUBLE)/count(*)"
 	case "total_input_tokens":
 		expression = "sum(input_tokens)"
 	case "total_output_tokens":
@@ -394,8 +394,8 @@ func (s *Store) AIStats(ctx context.Context, groupBy, aggregate string, filter A
 		SELECT s.trace_id, s.span_id, s.status, s.duration_ms FROM spans s WHERE ` + where + `
 	), bucketed AS (
 		SELECT ` + groupExpression + ` AS group_name, f.duration_ms, 0 AS error_count,
-			coalesce(CASE WHEN input.value=trim(input.value) THEN try_cast(input.value AS DOUBLE) END, 0) AS input_tokens,
-			coalesce(CASE WHEN output.value=trim(output.value) THEN try_cast(output.value AS DOUBLE) END, 0) AS output_tokens
+			coalesce(CASE WHEN input.value=trim(input.value) THEN gotel_number(input.value) END, 0) AS input_tokens,
+			coalesce(CASE WHEN output.value=trim(output.value) THEN gotel_number(output.value) END, 0) AS output_tokens
 		FROM filtered f
 		LEFT JOIN span_attributes input ON input.trace_id=f.trace_id AND input.span_id=f.span_id AND input.key='` + inputKey + `'
 		LEFT JOIN span_attributes output ON output.trace_id=f.trace_id AND output.span_id=f.span_id AND output.key='` + outputKey + `'

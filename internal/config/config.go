@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -31,6 +32,16 @@ type Config struct {
 	RetentionTraceBatch      int
 	RetentionLogBatch        int
 	RetentionIntervalSeconds int
+	MaxRequestBytes          int
+	MaxConcurrentIngest      int
+	MaxOutstandingRecords    int
+	MaxOutstandingBytes      int
+	MaxBatchRecords          int
+	MaxBatchBytes            int
+	MaxBatchWork             int
+	WriteTimeoutSeconds      int
+	ShutdownTimeoutSeconds   int
+	ingestionParseError      string
 }
 
 func Load() Config {
@@ -54,10 +65,10 @@ func Load() Config {
 		}
 	}
 	host = firstNonBlank(os.Getenv("GOTEL_OTEL_HOST"), host)
-	dbPath := firstNonBlank(os.Getenv("GOTEL_OTEL_DB_PATH"), filepath.Join(stateDir, "telemetry.duckdb"))
+	dbPath := firstNonBlank(os.Getenv("GOTEL_OTEL_DB_PATH"), filepath.Join(stateDir, "telemetry.sqlite"))
 	exporterURL := firstNonBlank(os.Getenv("GOTEL_OTEL_EXPORTER_URL"), resolveURL(parsed, "v1/traces"))
 	telemetryURL := firstNonBlank(os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"), standardTraceURL(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")), exporterURL)
-	return Config{
+	cfg := Config{
 		Enabled:                  enabled(os.Getenv("GOTEL_OTEL_ENABLED")),
 		ServiceName:              firstNonBlank(os.Getenv("GOTEL_OTEL_SERVICE_NAME"), "gotel-otel-tui"),
 		BaseURL:                  base,
@@ -78,6 +89,59 @@ func Load() Config {
 		RetentionLogBatch:        positiveInt(os.Getenv("GOTEL_OTEL_RETENTION_LOG_BATCH"), 5000),
 		RetentionIntervalSeconds: positiveInt(os.Getenv("GOTEL_OTEL_RETENTION_INTERVAL_SECONDS"), 10),
 	}
+	for _, setting := range cfg.ingestionSettings() {
+		*setting.value = setting.fallback
+		if raw := strings.TrimSpace(os.Getenv(setting.name)); raw != "" {
+			value, err := strconv.Atoi(raw)
+			if err != nil {
+				cfg.ingestionParseError = setting.name + " must be an integer"
+			} else {
+				*setting.value = value
+			}
+		}
+	}
+	return cfg
+}
+
+type ingestionSetting struct {
+	name     string
+	value    *int
+	fallback int
+	maximum  int
+}
+
+func (cfg *Config) ingestionSettings() []ingestionSetting {
+	return []ingestionSetting{
+		{"GOTEL_OTEL_MAX_REQUEST_BYTES", &cfg.MaxRequestBytes, 4 << 20, 1 << 30},
+		{"GOTEL_OTEL_MAX_CONCURRENT_INGEST", &cfg.MaxConcurrentIngest, 2, 1024},
+		{"GOTEL_OTEL_MAX_OUTSTANDING_RECORDS", &cfg.MaxOutstandingRecords, 10000, 1000000},
+		{"GOTEL_OTEL_MAX_OUTSTANDING_BYTES", &cfg.MaxOutstandingBytes, 64 << 20, 1 << 30},
+		{"GOTEL_OTEL_MAX_BATCH_RECORDS", &cfg.MaxBatchRecords, 256, 1000000},
+		{"GOTEL_OTEL_MAX_BATCH_BYTES", &cfg.MaxBatchBytes, 2 << 20, 1 << 30},
+		{"GOTEL_OTEL_MAX_BATCH_WORK", &cfg.MaxBatchWork, 8192, 10000000},
+		{"GOTEL_OTEL_WRITE_TIMEOUT_SECONDS", &cfg.WriteTimeoutSeconds, 5, 300},
+		{"GOTEL_OTEL_SHUTDOWN_TIMEOUT_SECONDS", &cfg.ShutdownTimeoutSeconds, 20, 300},
+	}
+}
+
+// ValidateIngestion rejects invalid limits rather than silently disabling bounds.
+// Load preserves its historical API; numeric environment parse errors surface here.
+func (cfg Config) ValidateIngestion() error {
+	if cfg.ingestionParseError != "" {
+		return fmt.Errorf("invalid ingestion configuration: %s", cfg.ingestionParseError)
+	}
+	for _, setting := range cfg.ingestionSettings() {
+		if *setting.value <= 0 || *setting.value > setting.maximum {
+			return fmt.Errorf("%s must be between 1 and %d", setting.name, setting.maximum)
+		}
+	}
+	if cfg.MaxBatchRecords > cfg.MaxOutstandingRecords {
+		return fmt.Errorf("GOTEL_OTEL_MAX_BATCH_RECORDS exceeds GOTEL_OTEL_MAX_OUTSTANDING_RECORDS")
+	}
+	if cfg.MaxBatchBytes > cfg.MaxOutstandingBytes {
+		return fmt.Errorf("GOTEL_OTEL_MAX_BATCH_BYTES exceeds GOTEL_OTEL_MAX_OUTSTANDING_BYTES")
+	}
+	return nil
 }
 
 func LoadManaged() Config {

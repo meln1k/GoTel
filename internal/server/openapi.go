@@ -23,6 +23,15 @@ func openAPISpec() map[string]any {
 		if endpoint.HasError {
 			responses["500"] = jsonResponse("Error", ref("ErrorResponse"))
 		}
+		if endpoint.Operation == api.IngestTraces || endpoint.Operation == api.IngestLogs {
+			success["description"] = "Accepted into bounded process memory, not persisted; X-GoTel-Acknowledgment: accepted-not-persisted"
+			success["content"].(map[string]any)["application/x-protobuf"] = map[string]any{"schema": map[string]any{"type": "string", "format": "binary"}}
+			for code, description := range map[string]string{"400": "Invalid telemetry", "413": "Request or record exceeds configured limits", "503": "Retryable overload or stopping; Retry-After: 1", "500": "Admission failure"} {
+				response := jsonResponse(description, ref("OTLPStatus"))
+				response["content"].(map[string]any)["application/x-protobuf"] = map[string]any{"schema": map[string]any{"type": "string", "format": "binary"}}
+				responses[code] = response
+			}
+		}
 		operation := map[string]any{
 			"operationId": string(endpoint.Operation),
 			"summary":     endpoint.Summary,
@@ -38,6 +47,9 @@ func openAPISpec() map[string]any {
 		}
 		if endpoint.JSONRequest {
 			operation["requestBody"] = arbitraryJSONBody()
+			if endpoint.Operation == api.IngestTraces || endpoint.Operation == api.IngestLogs {
+				operation["requestBody"].(map[string]any)["content"].(map[string]any)["application/x-protobuf"] = map[string]any{"schema": map[string]any{"type": "string", "format": "binary"}}
+			}
 		}
 		entry, _ := paths[endpoint.Path].(map[string]any)
 		if entry == nil {
@@ -172,9 +184,13 @@ func componentSchemas() map[string]any {
 
 	return map[string]any{
 		"ErrorResponse": objectSchema(map[string]any{"error": stringSchema()}, "error"),
+		"OTLPStatus":    objectSchema(map[string]any{"code": numberSchema(), "message": stringSchema(), "details": arraySchema(map[string]any{})}, "code", "message"),
 		"Health": objectSchema(map[string]any{
 			"ok": booleanSchema(), "service": stringSchema(), "databasePath": stringSchema(), "pid": numberSchema(),
-			"url": stringSchema(), "workdir": stringSchema(), "startedAt": dateTimeSchema(), "version": stringSchema(), "instanceId": stringSchema(),
+			"databaseBackend": stringSchema(),
+			"ready":           booleanSchema(), "persistence": map[string]any{"type": "object"}, "ingestion": map[string]any{"type": "object"},
+			"shutdownTimeoutSeconds": numberSchema(),
+			"url":                    stringSchema(), "workdir": stringSchema(), "startedAt": dateTimeSchema(), "version": stringSchema(), "instanceId": stringSchema(),
 		}, "ok", "service", "databasePath", "pid", "url", "workdir", "startedAt", "version"),
 		"IngestTraceResponse": objectSchema(map[string]any{"insertedSpans": numberSchema()}, "insertedSpans"),
 		"IngestLogResponse":   objectSchema(map[string]any{"insertedLogs": numberSchema()}, "insertedLogs"),

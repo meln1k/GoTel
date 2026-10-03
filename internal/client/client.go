@@ -17,15 +17,19 @@ import (
 )
 
 type Health struct {
-	OK           bool   `json:"ok"`
-	Service      string `json:"service"`
-	DatabasePath string `json:"databasePath"`
-	PID          int    `json:"pid"`
-	URL          string `json:"url"`
-	Workdir      string `json:"workdir"`
-	StartedAt    string `json:"startedAt"`
-	Version      string `json:"version"`
-	InstanceID   string `json:"instanceId,omitempty"`
+	OK                     bool            `json:"ok"`
+	Ready                  bool            `json:"ready"`
+	Persistence            json.RawMessage `json:"persistence,omitempty"`
+	ShutdownTimeoutSeconds int             `json:"shutdownTimeoutSeconds,omitempty"`
+	Service                string          `json:"service"`
+	DatabasePath           string          `json:"databasePath"`
+	DatabaseBackend        string          `json:"databaseBackend,omitempty"`
+	PID                    int             `json:"pid"`
+	URL                    string          `json:"url"`
+	Workdir                string          `json:"workdir"`
+	StartedAt              string          `json:"startedAt"`
+	Version                string          `json:"version"`
+	InstanceID             string          `json:"instanceId,omitempty"`
 }
 
 type Client struct {

@@ -1,18 +1,22 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/meln1k/gotel/internal/api"
@@ -20,6 +24,9 @@ import (
 	"github.com/meln1k/gotel/internal/otlp"
 	"github.com/meln1k/gotel/internal/store"
 	"github.com/meln1k/gotel/internal/telemetry"
+	statuspb "google.golang.org/genproto/googleapis/rpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 //go:embed docs/*.md
@@ -35,14 +42,16 @@ type Identity struct {
 }
 
 type Server struct {
-	config   config.Config
-	store    *store.Store
-	identity Identity
-	handler  http.Handler
+	config           config.Config
+	store            *store.Store
+	identity         Identity
+	handler          http.Handler
+	ingestSlots      chan struct{}
+	rejectedRequests atomic.Uint64
 }
 
 func New(cfg config.Config, telemetryStore *store.Store, identity Identity) *Server {
-	server := &Server{config: cfg, store: telemetryStore, identity: identity}
+	server := &Server{config: cfg, store: telemetryStore, identity: identity, ingestSlots: make(chan struct{}, max(0, cfg.MaxConcurrentIngest))}
 	server.handler = server.routes()
 	return server
 }
@@ -50,18 +59,31 @@ func New(cfg config.Config, telemetryStore *store.Store, identity Identity) *Ser
 func (s *Server) Handler() http.Handler { return s.handler }
 
 func (s *Server) Run(ctx context.Context) error {
+	if err := s.config.ValidateIngestion(); err != nil {
+		return err
+	}
+	requests, cancelRequests := context.WithCancel(context.Background())
+	defer cancelRequests()
 	httpServer := &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", s.config.Host, s.config.Port),
+		Addr:              net.JoinHostPort(s.config.Host, strconv.Itoa(s.config.Port)),
 		Handler:           s.handler,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return requests },
 	}
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpServer.ListenAndServe() }()
 	select {
 	case <-ctx.Done():
+		s.store.StopAdmission()
+		cancelRequests()
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return httpServer.Shutdown(shutdownContext)
+		if err := httpServer.Shutdown(shutdownContext); err != nil {
+			return errors.Join(err, httpServer.Close())
+		}
+		return nil
 	case err := <-errCh:
 		if err == http.ErrServerClosed {
 			return nil
@@ -104,10 +126,15 @@ func (s *Server) root(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
+	persistence := s.store.Stats()
 	response := map[string]any{
 		"ok": true, "service": "gotel-local-server", "databasePath": s.identity.DatabasePath,
-		"pid": s.identity.PID, "url": s.identity.URL, "workdir": s.identity.Workdir,
+		"databaseBackend": "sqlite",
+		"pid":             s.identity.PID, "url": s.identity.URL, "workdir": s.identity.Workdir,
 		"startedAt": s.identity.StartedAt, "version": config.Version,
+		"ready": persistence.Ready, "persistence": persistence,
+		"ingestion":              map[string]any{"decodingRequests": len(s.ingestSlots), "rejectedRequests": s.rejectedRequests.Load()},
+		"shutdownTimeoutSeconds": s.config.ShutdownTimeoutSeconds,
 	}
 	if s.identity.InstanceID != "" {
 		response["instanceId"] = s.identity.InstanceID
@@ -116,41 +143,103 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) ingestTraces(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	records, err := otlp.ParseTraces(body, protobufContent(r.Header.Get("Content-Type")))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	inserted, err := s.store.IngestSpans(r.Context(), records)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]int{"insertedSpans": inserted})
+	s.ingest(w, r, "insertedSpans", func(body []byte, protobuf bool) (int, error) {
+		records, err := otlp.ParseTraces(body, protobuf)
+		if err != nil {
+			return 0, errInvalidPayload
+		}
+		return s.store.IngestSpans(r.Context(), records)
+	})
 }
 
 func (s *Server) ingestLogs(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	s.ingest(w, r, "insertedLogs", func(body []byte, protobuf bool) (int, error) {
+		records, err := otlp.ParseLogs(body, protobuf)
+		if err != nil {
+			return 0, errInvalidPayload
+		}
+		return s.store.IngestLogs(r.Context(), records)
+	})
+}
+
+var errInvalidPayload = errors.New("invalid OTLP payload")
+
+// The shared slot covers body reading, decoding, and queue admission, not persistence.
+func (s *Server) ingest(w http.ResponseWriter, r *http.Request, countField string, admit func([]byte, bool) (int, error)) {
+	accepted := false
+	defer func() {
+		if !accepted {
+			s.rejectedRequests.Add(1)
+		}
+	}()
+	select {
+	case s.ingestSlots <- struct{}{}:
+		defer func() { <-s.ingestSlots }()
+	default:
+		writeIngestError(w, r, store.ErrOverloaded)
 		return
 	}
-	records, err := otlp.ParseLogs(body, protobufContent(r.Header.Get("Content-Type")))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if r.Context().Err() != nil {
+		writeIngestError(w, r, store.ErrClosed)
 		return
 	}
-	inserted, err := s.store.IngestLogs(r.Context(), records)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, int64(s.config.MaxRequestBytes)))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeIngestError(w, r, store.ErrRecordTooLarge)
+		} else {
+			writeIngestError(w, r, errInvalidPayload)
+		}
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]int{"insertedLogs": inserted})
+	if r.Context().Err() != nil {
+		writeIngestError(w, r, store.ErrClosed)
+		return
+	}
+	protobuf := protobufContent(r.Header.Get("Content-Type"))
+	if !protobuf && (!json.Valid(body) || !bytes.HasPrefix(bytes.TrimSpace(body), []byte("{"))) {
+		writeIngestError(w, r, errInvalidPayload)
+		return
+	}
+	inserted, err := admit(body, protobuf)
+	if err != nil {
+		writeIngestError(w, r, err)
+		return
+	}
+	accepted = true
+	w.Header().Set("X-GoTel-Acknowledgment", "accepted-not-persisted")
+	if protobuf {
+		// An empty protobuf message is a valid OTLP Export*ServiceResponse.
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{countField: inserted})
+}
+
+func writeIngestError(w http.ResponseWriter, r *http.Request, err error) {
+	httpStatus, code, message := http.StatusInternalServerError, int32(13), "Telemetry admission failed"
+	switch {
+	case errors.Is(err, store.ErrOverloaded), errors.Is(err, store.ErrClosed), errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		httpStatus, code, message = http.StatusServiceUnavailable, 8, "Telemetry admission unavailable; retry later"
+		w.Header().Set("Retry-After", "1")
+	case errors.Is(err, store.ErrRecordTooLarge):
+		httpStatus, code, message = http.StatusRequestEntityTooLarge, 8, "Telemetry request or record exceeds configured limits"
+	case errors.Is(err, store.ErrInvalidRecord), errors.Is(err, errInvalidPayload):
+		httpStatus, code, message = http.StatusBadRequest, 3, "Invalid telemetry request"
+	}
+	status := &statuspb.Status{Code: code, Message: message}
+	var body []byte
+	if protobufContent(r.Header.Get("Content-Type")) {
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		body, _ = proto.Marshal(status)
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+		body, _ = protojson.Marshal(status)
+	}
+	w.WriteHeader(httpStatus)
+	_, _ = w.Write(body)
 }
 
 func (s *Server) services(w http.ResponseWriter, r *http.Request) {

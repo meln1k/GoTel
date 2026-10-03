@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 SECONDS=0
 
-echo 'Checking system dependencies for Go and DuckDB (CGO)'
+echo 'Checking system dependencies for Go and SQLite (CGO)'
 missing_packages=()
 for package in build-essential ca-certificates curl jq; do
   if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != 'install ok installed' ]]; then
@@ -47,6 +47,6 @@ echo 'Downloading modules from go.mod/go.sum'
 go mod download
 echo "Modules ready (${SECONDS}s elapsed)"
 
-echo 'Warming the Go build cache, including the embedded DuckDB driver'
+echo 'Warming the Go build cache, including the embedded SQLite driver'
 go build ./cmd/...
 echo "Setup finished (${SECONDS}s elapsed)"

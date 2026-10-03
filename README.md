@@ -12,7 +12,23 @@ GoTel supports macOS and Linux on amd64 and arm64.
 
 ### Linux binaries
 
-Prebuilt archives are available from [GitHub releases](https://github.com/meln1k/GoTel/releases). Check the release notes: older published binaries predate this SQLite-only implementation. To use the code in this checkout, build from source below. SQLite is embedded; no database server or separately installed SQLite library is needed.
+Download [GoTel v0.2](https://github.com/meln1k/GoTel/releases/tag/v0.2) without installing Go or a compiler. SQLite is embedded; no database server or separately installed SQLite library is needed. The binaries require glibc 2.34+; Alpine/musl is not supported by these builds.
+
+Choose the archive for your architecture. These commands only download to the current directory.
+
+**Linux x86-64 (amd64):**
+
+```bash
+curl -fLO https://github.com/meln1k/GoTel/releases/download/v0.2/gotel-v0.2-linux-amd64.tar.gz
+```
+
+**Linux ARM64 (aarch64):**
+
+```bash
+curl -fLO https://github.com/meln1k/GoTel/releases/download/v0.2/gotel-v0.2-linux-arm64.tar.gz
+```
+
+Each archive contains `gotel` and `gotel-mcp`. Extract them wherever you prefer; no installation or `PATH` changes happen automatically. [SHA-256 checksums](https://github.com/meln1k/GoTel/releases/download/v0.2/SHA256SUMS) are available for verification. Stop an older server before upgrading; older database formats are not automatically migrated (see [SQLite storage](#sqlite-storage)).
 
 ### From source
 

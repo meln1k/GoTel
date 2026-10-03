@@ -8,7 +8,31 @@ GoTel has no TUI or browser UI, ask you coding agent to use GoTel instead.
 
 ## Install
 
-GoTel supports macOS and Linux on amd64 and arm64. The embedded DuckDB driver requires CGO and a C/C++ compiler.
+GoTel supports macOS and Linux on amd64 and arm64.
+
+### Linux binaries
+
+Download a [GitHub release](https://github.com/meln1k/GoTel/releases) without installing Go, a compiler, or DuckDB. The binaries include DuckDB but require glibc 2.34+ and the standard C/C++ runtime libraries (`libstdc++` and `libgcc`). Alpine/musl is not supported by these builds.
+
+Choose the archive for your architecture. These commands only download to the current directory.
+
+**Linux x86-64 (amd64):**
+
+```bash
+curl -fLO https://github.com/meln1k/GoTel/releases/download/v0.1/gotel-v0.1-linux-amd64.tar.gz
+```
+
+**Linux ARM64 (aarch64):**
+
+```bash
+curl -fLO https://github.com/meln1k/GoTel/releases/download/v0.1/gotel-v0.1-linux-arm64.tar.gz
+```
+
+Each archive contains `gotel` and `gotel-mcp`. Extract them wherever you prefer; no installation or `PATH` changes happen automatically. [SHA-256 checksums](https://github.com/meln1k/GoTel/releases/download/v0.1/SHA256SUMS) are available for verification.
+
+### From source
+
+For macOS or a source install on Linux, install Go and a C/C++ compiler. The embedded DuckDB driver requires CGO.
 
 ```bash
 go install github.com/meln1k/gotel/cmd/...@latest
